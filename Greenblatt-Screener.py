@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Magic Formula Screener (Fast Version)
--------------------------------------
-Reads tickers from 'potential_stocks.txt' (e.g. LSE:RCH,LSE:PHAR,...)
-Fetches financials concurrently using threads.
-Computes:
- - Return on Tangible Capital (ROTC)
- - Earnings Yield (EBIT / EV)
-Ranks them Greenblatt-style and exports results to CSV.
+Magic Formula Screener (Pure Greenblatt Version — Final Stable)
+---------------------------------------------------------------
+Now includes:
+ - 0.1s delay to avoid rate limits
+ - Tie marker & Tie_Group column
+ - Counted summary of missing tickers
+ - Automatic 'missing_tickers.csv' export
+ - Handles Yahoo 404 / 'Quote not found' gracefully
 """
 
 # -------------------------------------------------
@@ -19,13 +19,10 @@ import subprocess
 import sys
 
 def ensure_package(pkg):
-    """Install a package quietly if not already present."""
     if importlib.util.find_spec(pkg) is None:
         print(f"📦 Installing {pkg} ...")
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet", pkg]
-            )
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pkg])
             print(f"✅ Installed {pkg}")
         except subprocess.CalledProcessError:
             print(f"❌ Failed to install {pkg}. Please run: pip install {pkg}")
@@ -44,22 +41,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 # -------------------------------------------------
-# Load tickers from file
+# Load tickers
 # -------------------------------------------------
 file_path = "potential_stocks.txt"
 if not os.path.exists(file_path):
-    raise FileNotFoundError(f"⚠️  Can't find {file_path}. Please place it in the same folder.")
+    raise FileNotFoundError(f"⚠️  Can't find {file_path}.")
 
 with open(file_path, "r") as f:
-    content = f.read().strip()
+    tickers = [
+        line.replace("LSE:", "").strip() + ".L"
+        for line in f.read().strip().split(",")
+        if line.strip()
+    ]
 
-tickers = [
-    line.replace("LSE:", "").strip() + ".L"
-    for line in content.split(",")
-    if line.strip()
-]
-
-print(f"\n📂 Loaded {len(tickers)} tickers from {file_path}:")
+print(f"\n📂 Loaded {len(tickers)} tickers from {file_path}")
 print(", ".join(tickers))
 print("\n🚀 Fetching financials using multithreading...\n")
 
@@ -83,16 +78,21 @@ def fmt(num):
         return f"{num:.2f}"
 
 # -------------------------------------------------
-# Fetch function for each ticker
+# Fetch
 # -------------------------------------------------
 def fetch_ticker_data(t):
     """Fetch financials for a single ticker via yfinance."""
     try:
+        time.sleep(0.1)  # rate-limit safety
         stock = yf.Ticker(t)
         info = stock.info
+
+        # Catch invalid tickers or Yahoo 404s
+        if not info or "longName" not in info:
+            return {"Ticker": t}
+
         bs = stock.balance_sheet
         is_ = stock.financials
-
         if bs.empty or is_.empty:
             return {"Ticker": t}
 
@@ -131,16 +131,21 @@ def fetch_ticker_data(t):
             "EV": ev,
             "Earnings Yield": earnings_yield
         }
+
     except Exception as e:
-        return {"Ticker": t, "Error": str(e)}
+        if "Quote not found" in str(e):
+            print(f"⚠️  Quote not found for {t}")
+        else:
+            print(f"⚠️  Error fetching {t}: {e}")
+        return {"Ticker": t}
 
 # -------------------------------------------------
-# Multithreaded execution
+# Multithreaded fetch
 # -------------------------------------------------
 rows = []
-max_threads = min(10, len(tickers))  # 10 threads is safe for Yahoo
+max_threads = min(5, len(tickers))
 
-start_time = time.time()
+start = time.time()
 with ThreadPoolExecutor(max_workers=max_threads) as executor:
     futures = {executor.submit(fetch_ticker_data, t): t for t in tickers}
     for i, future in enumerate(as_completed(futures), 1):
@@ -152,35 +157,79 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
         except Exception as e:
             print(f"[{i}/{len(tickers)}] ❌ {t} error: {e}")
 
-elapsed = time.time() - start_time
-print(f"\n⏱️  Completed fetch for {len(tickers)} tickers in {elapsed:.1f}s\n")
+print(f"\n⏱️  Completed fetch for {len(tickers)} tickers in {time.time()-start:.1f}s\n")
 
 # -------------------------------------------------
 # Ranking & output
 # -------------------------------------------------
-df = pd.DataFrame(rows).dropna(subset=["ROTC", "Earnings Yield"])
-if df.empty:
-    print("⚠️  No valid data retrieved. Check your ticker list or internet connection.")
-    sys.exit(0)
+df = pd.DataFrame(rows)
+no_data = df[df["EBIT"].isna() | df["EV"].isna() | df["Tangible Capital"].isna()]
+valid_df = df.dropna(subset=["EBIT", "EV", "Tangible Capital"])
 
-df["ROTC %"] = df["ROTC"] * 100
-df["Earnings Yield %"] = df["Earnings Yield"] * 100
-df["Rank_ROTC"] = df["ROTC"].rank(ascending=False)
-df["Rank_EY"] = df["Earnings Yield"].rank(ascending=False)
-df["Magic_Rank"] = (df["Rank_ROTC"] + df["Rank_EY"]).rank()
-df = df.sort_values("Magic_Rank")
+# Greenblatt filters
+valid_df = valid_df[
+    (valid_df["EBIT"] > 0) &
+    (valid_df["EV"] > 0) &
+    (valid_df["Tangible Capital"] > 1e6)
+]
 
-print("\n📊  Joel Greenblatt — Magic Formula Screener Results\n")
-print("-" * 100)
-for _, r in df.iterrows():
+# Metrics
+valid_df["ROTC"] = valid_df["EBIT"] / valid_df["Tangible Capital"]
+valid_df["Earnings Yield"] = valid_df["EBIT"] / valid_df["EV"]
+valid_df = valid_df[(valid_df["ROTC"] < 2) & (valid_df["Earnings Yield"] < 1)]
+
+# Ranks
+valid_df["Rank_ROTC"] = valid_df["ROTC"].rank(ascending=False)
+valid_df["Rank_EY"] = valid_df["Earnings Yield"].rank(ascending=False)
+valid_df["Magic_Rank_Score"] = valid_df["Rank_ROTC"] + valid_df["Rank_EY"]
+
+# Sort & reset
+valid_df = valid_df.sort_values("Magic_Rank_Score").reset_index(drop=True)
+valid_df["Magic_Rank"] = valid_df.index + 1
+valid_df["Tie"] = valid_df["Magic_Rank_Score"].round(2).diff().fillna(1) == 0
+valid_df["Tie_Group"] = (valid_df["Tie"] == False).cumsum()
+
+# Display fields
+valid_df["ROTC %"] = valid_df["ROTC"] * 100
+valid_df["Earnings Yield %"] = valid_df["Earnings Yield"] * 100
+valid_df["EV/EBIT"] = 1 / valid_df["Earnings Yield"]
+valid_df["Payback (yrs)"] = 1 / valid_df["Earnings Yield"]
+
+# -------------------------------------------------
+# Print results
+# -------------------------------------------------
+print("\n📊  Joel Greenblatt — PURE Magic Formula Screener Results\n"
+      " Stocks are ranked by both EV/EBIT and ROTC and summed.\n")
+print("-" * 115)
+
+for _, r in valid_df.iterrows():
+    tie_marker = " ← tied" if r["Tie"] else ""
     print(
-        f"{int(r['Magic_Rank']):2d}. {r['Ticker']:6} | "
-        f"ROTC: {r['ROTC %']:6.1f}% | "
+        f"{int(r['Magic_Rank']):3d}. {r['Ticker']:6} | "
+        f"ROTC: {r['ROTC %']:7.1f}% | "
         f"Earnings Yield: {r['Earnings Yield %']:6.1f}% | "
-        f"EV: {fmt(r['EV']):>10} | "
-        f"EBIT: {fmt(r['EBIT']):>10}"
+        f"EV/EBIT: {r['EV/EBIT']:6.1f}× | "
+        f"Payback: {r['Payback (yrs)']:5.1f} yrs | "
+        f"Tie Group: {int(r['Tie_Group']):3d}{tie_marker}"
     )
-print("-" * 100)
 
-df.to_csv("magic_formula_results.csv", index=False)
-print(f"\n✅ Done — results saved to 'magic_formula_results.csv'\n")
+print("-" * 115)
+
+# -------------------------------------------------
+# Missing data summary + save missing tickers
+# -------------------------------------------------
+if not no_data.empty:
+    missing_unique = sorted(no_data["Ticker"].unique())
+    count = len(missing_unique)
+    print(f"\n⚠️  {count} tickers with missing or no financial data:")
+    print(", ".join(missing_unique))
+    pd.DataFrame(missing_unique, columns=["Ticker"]).to_csv("missing_tickers.csv", index=False)
+    print("💾 Missing tickers saved to 'missing_tickers.csv'\n")
+else:
+    print("\n✅ All tickers returned financial data.")
+
+# -------------------------------------------------
+# Save main output
+# -------------------------------------------------
+valid_df.to_csv("magic_formula_pure.csv", index=False)
+print(f"✅ Done — results saved to 'magic_formula_pure.csv'\n")
