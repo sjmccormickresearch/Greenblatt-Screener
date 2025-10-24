@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Magic Formula Screener (Pure Greenblatt Version — Final Stable)
----------------------------------------------------------------
+Greenblatt Screener — Pure Magic Formula (Final Clean Version)
+--------------------------------------------------------------
+Ranks stocks using Joel Greenblatt’s “Magic Formula”:
+ - High Earnings Yield (EBIT / EV)
+ - High Return on Tangible Capital (EBIT / Tangible Capital)
+
 Now includes:
- - 0.1s delay to avoid rate limits
- - Tie marker & Tie_Group column
- - Counted summary of missing tickers
- - Automatic 'missing_tickers.csv' export
- - Handles Yahoo 404 / 'Quote not found' gracefully
+ - 0.1s delay to avoid Yahoo rate limits
+ - Clean, minimal console output (no tie clutter)
+ - Auto-install for pandas & yfinance
+ - Missing / invalid ticker separation
+ - Saves results to 'greenblatt_results.csv'
 """
 
 # -------------------------------------------------
-# Auto-install required packages if missing
+# Auto-install required packages
 # -------------------------------------------------
 import importlib.util
 import subprocess
@@ -37,8 +41,8 @@ for package in ["pandas", "yfinance"]:
 import pandas as pd
 import yfinance as yf
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -------------------------------------------------
 # Load tickers
@@ -67,16 +71,6 @@ def get_first_available(df, keys):
             return df.loc[key].iloc[0]
     return None
 
-def fmt(num):
-    if num is None or pd.isna(num):
-        return "-"
-    if abs(num) >= 1_000_000_000:
-        return f"{num/1_000_000_000:.2f}B"
-    elif abs(num) >= 1_000_000:
-        return f"{num/1_000_000:.2f}M"
-    else:
-        return f"{num:.2f}"
-
 # -------------------------------------------------
 # Fetch
 # -------------------------------------------------
@@ -89,12 +83,12 @@ def fetch_ticker_data(t):
 
         # Catch invalid tickers or Yahoo 404s
         if not info or "longName" not in info:
-            return {"Ticker": t}
+            return {"Ticker": t, "Error": "Quote not found"}
 
         bs = stock.balance_sheet
         is_ = stock.financials
         if bs.empty or is_.empty:
-            return {"Ticker": t}
+            return {"Ticker": t, "Error": "Empty financials"}
 
         ebit = get_first_available(is_, ["EBIT", "Ebit", "Operating Income"])
         total_current_assets = get_first_available(bs, ["Total Current Assets"])
@@ -112,16 +106,17 @@ def fetch_ticker_data(t):
         ])
         total_debt = get_first_available(bs, ["Total Debt", "Long Term Debt"]) or 0
 
+        # Calculate tangible capital and metrics
         op_nwc = (total_current_assets or 0) - (cash or 0) - (total_current_liabilities or 0) + (short_term_debt or 0)
         tangible_cap = (net_ppe or 0) + op_nwc
-        rotc = ebit / tangible_cap if tangible_cap else None
+        rotc = ebit / tangible_cap if (ebit is not None and tangible_cap) else None
 
         market_cap = info.get("marketCap")
         if market_cap is None and info.get("sharesOutstanding") and info.get("currentPrice"):
             market_cap = info["sharesOutstanding"] * info["currentPrice"]
 
         ev = (market_cap or 0) + (total_debt or 0) - (cash or 0)
-        earnings_yield = ebit / ev if ev else None
+        earnings_yield = ebit / ev if (ebit is not None and ev) else None
 
         return {
             "Ticker": t,
@@ -133,19 +128,15 @@ def fetch_ticker_data(t):
         }
 
     except Exception as e:
-        if "Quote not found" in str(e):
-            print(f"⚠️  Quote not found for {t}")
-        else:
-            print(f"⚠️  Error fetching {t}: {e}")
-        return {"Ticker": t}
+        return {"Ticker": t, "Error": str(e)}
 
 # -------------------------------------------------
 # Multithreaded fetch
 # -------------------------------------------------
 rows = []
 max_threads = min(5, len(tickers))
-
 start = time.time()
+
 with ThreadPoolExecutor(max_workers=max_threads) as executor:
     futures = {executor.submit(fetch_ticker_data, t): t for t in tickers}
     for i, future in enumerate(as_completed(futures), 1):
@@ -182,12 +173,8 @@ valid_df = valid_df[(valid_df["ROTC"] < 2) & (valid_df["Earnings Yield"] < 1)]
 valid_df["Rank_ROTC"] = valid_df["ROTC"].rank(ascending=False)
 valid_df["Rank_EY"] = valid_df["Earnings Yield"].rank(ascending=False)
 valid_df["Magic_Rank_Score"] = valid_df["Rank_ROTC"] + valid_df["Rank_EY"]
-
-# Sort & reset
 valid_df = valid_df.sort_values("Magic_Rank_Score").reset_index(drop=True)
 valid_df["Magic_Rank"] = valid_df.index + 1
-valid_df["Tie"] = valid_df["Magic_Rank_Score"].round(2).diff().fillna(1) == 0
-valid_df["Tie_Group"] = (valid_df["Tie"] == False).cumsum()
 
 # Display fields
 valid_df["ROTC %"] = valid_df["ROTC"] * 100
@@ -196,40 +183,46 @@ valid_df["EV/EBIT"] = 1 / valid_df["Earnings Yield"]
 valid_df["Payback (yrs)"] = 1 / valid_df["Earnings Yield"]
 
 # -------------------------------------------------
-# Print results
+# Print ranked results
 # -------------------------------------------------
-print("\n📊  Joel Greenblatt — PURE Magic Formula Screener Results\n"
+print("\n📊  Joel Greenblatt — Magic Formula Screener Results\n"
       " Stocks are ranked by both EV/EBIT and ROTC and summed.\n")
-print("-" * 115)
+print("-" * 110)
 
 for _, r in valid_df.iterrows():
-    tie_marker = " ← tied" if r["Tie"] else ""
     print(
         f"{int(r['Magic_Rank']):3d}. {r['Ticker']:6} | "
         f"ROTC: {r['ROTC %']:7.1f}% | "
         f"Earnings Yield: {r['Earnings Yield %']:6.1f}% | "
         f"EV/EBIT: {r['EV/EBIT']:6.1f}× | "
-        f"Payback: {r['Payback (yrs)']:5.1f} yrs | "
-        f"Tie Group: {int(r['Tie_Group']):3d}{tie_marker}"
+        f"Payback: {r['Payback (yrs)']:5.1f} yrs"
     )
 
-print("-" * 115)
+print("-" * 110)
 
 # -------------------------------------------------
-# Missing data summary + save missing tickers
+# Missing / invalid ticker handling
 # -------------------------------------------------
 if not no_data.empty:
     missing_unique = sorted(no_data["Ticker"].unique())
-    count = len(missing_unique)
-    print(f"\n⚠️  {count} tickers with missing or no financial data:")
-    print(", ".join(missing_unique))
-    pd.DataFrame(missing_unique, columns=["Ticker"]).to_csv("missing_tickers.csv", index=False)
-    print("💾 Missing tickers saved to 'missing_tickers.csv'\n")
+    invalid = df[df["Error"].notna()]["Ticker"].unique().tolist()
+    incomplete = [t for t in missing_unique if t not in invalid]
+
+    if invalid:
+        pd.DataFrame(invalid, columns=["Ticker"]).to_csv("invalid_tickers.csv", index=False)
+        print(f"🚫 {len(invalid)} invalid tickers saved to 'invalid_tickers.csv'")
+
+    if incomplete:
+        pd.DataFrame(incomplete, columns=["Ticker"]).to_csv("missing_tickers.csv", index=False)
+        print(f"💾 {len(incomplete)} incomplete tickers saved to 'missing_tickers.csv'")
+
+    total = len(invalid) + len(incomplete)
+    print(f"\n⚠️  Total {total} tickers with missing or incomplete financial data.")
 else:
     print("\n✅ All tickers returned financial data.")
 
 # -------------------------------------------------
-# Save main output
+# Save final ranked output
 # -------------------------------------------------
-valid_df.to_csv("magic_formula_pure.csv", index=False)
-print(f"✅ Done — results saved to 'magic_formula_pure.csv'\n")
+valid_df.to_csv("greenblatt_results.csv", index=False)
+print(f"✅ Done — results saved to 'greenblatt_results.csv'\n")
